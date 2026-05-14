@@ -23,7 +23,7 @@ import torchvision.datasets as datasets
 
 import timm
 
-assert timm.__version__ == "0.3.2"  # version check
+# assert timm.__version__ == "0.3.2"  # version check
 import timm.optim.optim_factory as optim_factory
 
 import util.misc as misc
@@ -36,6 +36,9 @@ from engine_pretrain import train_one_epoch
 import webdataset as wds
 import wandb
 
+IMAGENET_TRAIN_SAMPLES = 1281167
+NUM_CLASSES = 1000
+
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int,
@@ -43,7 +46,9 @@ def get_args_parser():
     parser.add_argument('--epochs', default=400, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
-
+    parser.add_argument("--bf16", action="store_true", help="Whether to use bfloat16 precision. Bf16 requires PyTorch > 1.10 and an Nvidia Ampere GPU.  Will use the value of accelerate config `bf16_full_eval` if not set.")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile to compile the training function. Requires PyTorch 2.0+ and a compatible CUDA version. Will use the value of accelerate config `torch_compile` if not set.")
+    
     # Model parameters
     parser.add_argument('--model', default='mae_vit_large_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
@@ -102,6 +107,25 @@ def get_args_parser():
 
     return parser
 
+def label_to_index(label):
+    return int(label) 
+
+def add_weight_decay(model, weight_decay=1e-5):
+    decay = []
+    no_decay = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim == 1 or name.endswith(".bias") or name in {"pos_embed", "cls_token", "mask_token"}:
+            no_decay.append(param)
+        else:
+            decay.append(param)
+
+    return [
+        {"params": no_decay, "weight_decay": 0.0},
+        {"params": decay, "weight_decay": weight_decay},
+    ]
 
 def main(args):
     misc.init_distributed_mode(args)
@@ -125,19 +149,24 @@ def main(args):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
     # dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    dataset_train = wds.WebDataset(args.data_path + "imagenet1k-train-{0000..1023}.tar",
+
+    world_size = args.world_size if args.distributed else 1
+    num_workers = max(1, args.num_workers) 
+    train_samples_per_worker = IMAGENET_TRAIN_SAMPLES // (world_size * num_workers)
+    
+    train_dataset = wds.WebDataset(args.data_path + "imagenet1k-train-{0000..1023}.tar",
                                        nodesplitter=wds.split_by_node,
                                        workersplitter=wds.split_by_worker,
                                        shardshuffle=1024).\
             shuffle(1000).decode("pil").to_tuple("jpg", "cls").map_tuple(
-             train_transforms, label_to_index
+             transform_train, label_to_index
         ).with_epoch(train_samples_per_worker) 
     
-    print(dataset_train)
+    print(train_dataset)
 
     data_loader_train = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size,
-        num_workers=args.workers, pin_memory=True, sampler=None,
+        num_workers=args.num_workers, pin_memory=True, sampler=None,
         drop_last=True, persistent_workers=True)
 
     # if True:  # args.distributed:
@@ -169,6 +198,10 @@ def main(args):
 
     model.to(device)
 
+    if args.compile:
+        print("Compiling the training function with torch.compile...")
+        model = torch.compile(model)
+
     model_without_ddp = model
     print("Model = %s" % str(model_without_ddp))
 
@@ -188,7 +221,7 @@ def main(args):
         model_without_ddp = model.module
     
     # following timm: set wd as 0 for bias and norm layers
-    param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
+    param_groups = add_weight_decay(model_without_ddp, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     print(optimizer)
     loss_scaler = NativeScaler()
@@ -198,8 +231,8 @@ def main(args):
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
+        # if args.distributed:
+        #     data_loader_train.sampler.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, data_loader_train,
             optimizer, device, epoch, loss_scaler,

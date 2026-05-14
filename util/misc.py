@@ -18,7 +18,6 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from torch._six import inf
 
 
 class SmoothedValue(object):
@@ -120,15 +119,16 @@ class MetricLogger(object):
     def add_meter(self, name, meter):
         self.meters[name] = meter
 
-    def log_every(self, iterable, print_freq, header=None):
+    def log_every(self, iterable, print_freq, header=None, iterable_len=None):
         i = 0
         if not header:
             header = ''
+        total = iterable_len if iterable_len is not None else len(iterable)
         start_time = time.time()
         end = time.time()
         iter_time = SmoothedValue(fmt='{avg:.4f}')
         data_time = SmoothedValue(fmt='{avg:.4f}')
-        space_fmt = ':' + str(len(str(len(iterable)))) + 'd'
+        space_fmt = ':' + str(len(str(total))) + 'd'
         log_msg = [
             header,
             '[{0' + space_fmt + '}/{1}]',
@@ -145,18 +145,18 @@ class MetricLogger(object):
             data_time.update(time.time() - end)
             yield obj
             iter_time.update(time.time() - end)
-            if i % print_freq == 0 or i == len(iterable) - 1:
-                eta_seconds = iter_time.global_avg * (len(iterable) - i)
+            if i % print_freq == 0 or i == total - 1:
+                eta_seconds = iter_time.global_avg * (total - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
                 if torch.cuda.is_available():
                     print(log_msg.format(
-                        i, len(iterable), eta=eta_string,
+                        i, total, eta=eta_string,
                         meters=str(self),
                         time=str(iter_time), data=str(data_time),
                         memory=torch.cuda.max_memory_allocated() / MB))
                 else:
                     print(log_msg.format(
-                        i, len(iterable), eta=eta_string,
+                        i, total, eta=eta_string,
                         meters=str(self),
                         time=str(iter_time), data=str(data_time)))
             i += 1
@@ -164,7 +164,7 @@ class MetricLogger(object):
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print('{} Total time: {} ({:.4f} s / it)'.format(
-            header, total_time_str, total_time / len(iterable)))
+            header, total_time_str, total_time / total))
 
 
 def setup_for_distributed(is_master):
@@ -226,16 +226,23 @@ def init_distributed_mode(args):
     elif 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ['WORLD_SIZE'])
-        args.gpu = int(os.environ['LOCAL_RANK'])
+        if 'LOCAL_RANK' in os.environ:
+            args.gpu = int(os.environ['LOCAL_RANK'])
+        elif 'SLURM_LOCALID' in os.environ:
+            args.gpu = int(os.environ['SLURM_LOCALID'])
+        else:
+            args.gpu = args.rank % torch.cuda.device_count()
     elif 'SLURM_PROCID' in os.environ:
         args.rank = int(os.environ['SLURM_PROCID'])
-        args.gpu = args.rank % torch.cuda.device_count()
+        args.world_size = int(os.environ.get('SLURM_NTASKS', args.world_size))
+        args.gpu = int(os.environ.get('SLURM_LOCALID', args.rank % torch.cuda.device_count()))
     else:
         print('Not using distributed mode')
         setup_for_distributed(is_master=True)  # hack
         args.distributed = False
         return
 
+    args.local_rank = args.gpu
     args.distributed = True
 
     torch.cuda.set_device(args.gpu)
@@ -244,7 +251,7 @@ def init_distributed_mode(args):
         args.rank, args.dist_url, args.gpu), flush=True)
     torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                          world_size=args.world_size, rank=args.rank)
-    torch.distributed.barrier()
+    torch.distributed.barrier(device_ids=[args.gpu])
     setup_for_distributed(args.rank == 0)
 
 
@@ -252,7 +259,7 @@ class NativeScalerWithGradNormCount:
     state_dict_key = "amp_scaler"
 
     def __init__(self):
-        self._scaler = torch.cuda.amp.GradScaler()
+        self._scaler = torch.amp.GradScaler("cuda")
 
     def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False, update_grad=True):
         self._scaler.scale(loss).backward(create_graph=create_graph)
@@ -285,7 +292,7 @@ def get_grad_norm_(parameters, norm_type: float = 2.0) -> torch.Tensor:
     if len(parameters) == 0:
         return torch.tensor(0.)
     device = parameters[0].grad.device
-    if norm_type == inf:
+    if norm_type == float('inf'):
         total_norm = max(p.grad.detach().abs().max().to(device) for p in parameters)
     else:
         total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]), norm_type)
@@ -298,8 +305,12 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
     if loss_scaler is not None:
         checkpoint_paths = [output_dir / ('checkpoint-%s.pth' % epoch_name)]
         for checkpoint_path in checkpoint_paths:
+            model_state = model_without_ddp.state_dict()
+            if getattr(args, 'compile', False):
+                model_state = {k.replace('_orig_mod.', ''): v for k, v in model_state.items()}
+
             to_save = {
-                'model': model_without_ddp.state_dict(),
+                'model': model_state,
                 'optimizer': optimizer.state_dict(),
                 'epoch': epoch,
                 'scaler': loss_scaler.state_dict(),
