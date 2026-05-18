@@ -38,6 +38,7 @@ import models_vit
 
 from engine_finetune import train_one_epoch, evaluate
 
+IMAGENET_VAL_SAMPLES = 50000
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE linear probing for image classification', add_help=False)
@@ -137,31 +138,38 @@ def main(args):
             transforms.CenterCrop(224),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    dataset_val = datasets.ImageFolder(os.path.join(args.data_path, 'val'), transform=transform_val)
+    
+    world_size = args.world_size if args.distributed else 1
+    num_workers = max(1, args.num_workers) 
+    train_samples_per_worker = IMAGENET_TRAIN_SAMPLES // (world_size * num_workers)
+
+    dataset_train = wds.WebDataset(args.data_path + "imagenet1k-train-{0000..1023}.tar",
+                                       nodesplitter=wds.split_by_node,
+                                       workersplitter=wds.split_by_worker,
+                                       shardshuffle=1024).\
+            shuffle(1000).decode("pil").to_tuple("jpg", "cls").map_tuple(
+             transform_train, label_to_index
+        ).with_epoch(train_samples_per_worker) 
+    
+    print(dataset_train)
+
+    dataset_val = (
+        wds.WebDataset(
+            args.data_path + "imagenet1k-validation-{00..63}.tar",
+            nodesplitter=wds.split_by_node,
+            workersplitter=wds.split_by_worker,
+            shardshuffle=False,
+        )
+        .decode("pil")
+        .to_tuple("jpg", "cls")
+        .map_tuple(transform_val, label_to_index)
+    )
+
     print(dataset_train)
     print(dataset_val)
 
-    if True:  # args.distributed:
-        num_tasks = misc.get_world_size()
-        global_rank = misc.get_rank()
-        sampler_train = torch.utils.data.DistributedSampler(
-            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-        )
-        print("Sampler_train = %s" % str(sampler_train))
-        if args.dist_eval:
-            if len(dataset_val) % num_tasks != 0:
-                print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
-                      'This will slightly alter validation results as extra duplicate entries are added to achieve '
-                      'equal num of samples per-process.')
-            sampler_val = torch.utils.data.DistributedSampler(
-                dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=True)  # shuffle=True to reduce monitor bias
-        else:
-            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-
+    global_rank = misc.get_rank()
+    
     if global_rank == 0 and not args.eval:
         run = wandb.init(project="mae-linprobe", config=vars(args))
     else:
@@ -258,7 +266,7 @@ def main(args):
 
     if args.eval:
         test_stats = evaluate(data_loader_val, model, device)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        print(f"Accuracy of the network on the {IMAGENET_VAL_SAMPLES} test images: {test_stats['acc1']:.1f}%")
         exit(0)
 
     print(f"Start training for {args.epochs} epochs")
@@ -280,7 +288,7 @@ def main(args):
                 loss_scaler=loss_scaler, epoch=epoch)
 
         test_stats = evaluate(data_loader_val, model, device)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        print(f"Accuracy of the network on the {IMAGENET_VAL_SAMPLES} test images: {test_stats['acc1']:.1f}%")
         max_accuracy = max(max_accuracy, test_stats["acc1"])
         print(f'Max accuracy: {max_accuracy:.2f}%')
 

@@ -82,12 +82,11 @@ def train_one_epoch(model: torch.nn.Module,
 
         loss_value_reduce = misc.all_reduce_mean(loss_value)
         if run is not None and (data_iter_step + 1) % accum_iter == 0:
-            epoch_1000x = int((data_iter_step / steps_per_epoch + epoch) * 1000)
+            # epoch_1000x = int((data_iter_step / steps_per_epoch + epoch) * 1000)
             run.log({
                 'train_loss': loss_value_reduce,
                 'lr': lr,
-                'epoch_1000x': epoch_1000x,
-            }, step=epoch_1000x)
+            }, step=data_iter_step + epoch * steps_per_epoch)
 
 
     # gather the stats from all processes

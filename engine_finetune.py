@@ -21,6 +21,8 @@ from timm.utils import accuracy
 import util.misc as misc
 import util.lr_sched as lr_sched
 
+IMAGENET_TRAIN_SAMPLES = 1281167
+IMAGENET_VAL_SAMPLES = 50000
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -34,14 +36,17 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     print_freq = 20
 
     accum_iter = args.accum_iter
+    steps_per_epoch = max(1, IMAGENET_TRAIN_SAMPLES // (args.batch_size * misc.get_world_size()))
 
     optimizer.zero_grad()
 
-    for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header, iterable_len=steps_per_epoch)):
+        if data_iter_step >= steps_per_epoch:
+            break
 
         # we use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
-            lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
+            lr_sched.adjust_learning_rate(optimizer, data_iter_step / steps_per_epoch + epoch, args)
 
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
@@ -49,7 +54,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
-        with torch.cuda.amp.autocast():
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             outputs = model(samples)
             loss = criterion(outputs, targets)
 
@@ -79,12 +84,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         loss_value_reduce = misc.all_reduce_mean(loss_value)
         if run is not None and (data_iter_step + 1) % accum_iter == 0:
-            epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             run.log({
                 'loss': loss_value_reduce,
                 'lr': max_lr,
-                'epoch_1000x': epoch_1000x,
-            }, step=epoch_1000x)
+            }, step=data_iter_step + epoch * steps_per_epoch)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -98,18 +101,20 @@ def evaluate(data_loader, model, device):
 
     metric_logger = misc.MetricLogger(delimiter="  ")
     header = 'Test:'
+    
+    test_steps_per_epoch = max(1, IMAGENET_VAL_SAMPLES // 64) # approximate to prevent len() error
 
     # switch to evaluation mode
     model.eval()
 
-    for batch in metric_logger.log_every(data_loader, 10, header):
+    for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, 10, header, iterable_len=test_steps_per_epoch)):
         images = batch[0]
         target = batch[-1]
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
         # compute output
-        with torch.cuda.amp.autocast():
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             output = model(images)
             loss = criterion(output, target)
 

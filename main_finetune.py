@@ -13,6 +13,7 @@ import argparse
 import datetime
 import json
 import numpy as np
+import math
 import os
 import time
 from pathlib import Path
@@ -21,22 +22,29 @@ import torch
 import torch.backends.cudnn as cudnn
 import wandb
 
+import webdataset as wds
+
 import timm
 
-assert timm.__version__ == "0.3.2" # version check
 from timm.models.layers import trunc_normal_
 from timm.data.mixup import Mixup
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 
 import util.lr_decay as lrd
 import util.misc as misc
-from util.datasets import build_dataset
+from util.datasets import build_dataset, build_transform
 from util.pos_embed import interpolate_pos_embed
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import models_vit
 
 from engine_finetune import train_one_epoch, evaluate
+
+IMAGENET_TRAIN_SAMPLES = 1281167
+IMAGENET_VAL_SAMPLES = 50000
+
+def label_to_index(label):
+    return int(label)
 
 
 def get_args_parser():
@@ -56,6 +64,12 @@ def get_args_parser():
 
     parser.add_argument('--drop_path', type=float, default=0.1, metavar='PCT',
                         help='Drop path rate (default: 0.1)')
+
+    parser.add_argument('--compile', action='store_true',
+                        help='Use torch.compile() to compile the model (default: False)')
+
+    parser.add_argument('--save_ckpt_freq', default=10, type=int,
+                        help='Frequency of saving checkpoints (default: 10)')
 
     # Optimizer parameters
     parser.add_argument('--clip_grad', type=float, default=None, metavar='NORM',
@@ -168,28 +182,35 @@ def main(args):
 
     cudnn.benchmark = True
 
-    dataset_train = build_dataset(is_train=True, args=args)
-    dataset_val = build_dataset(is_train=False, args=args)
+    transform_train = build_transform(is_train=True, args=args)
+    transform_val = build_transform(is_train=False, args=args)
+    world_size = args.world_size if args.distributed else 1
+    num_workers = max(1, args.num_workers) 
+    train_samples_per_worker = IMAGENET_TRAIN_SAMPLES // (world_size * num_workers)
+    
+    dataset_train = wds.WebDataset(args.data_path + "imagenet1k-train-{0000..1023}.tar",
+                                       nodesplitter=wds.split_by_node,
+                                       workersplitter=wds.split_by_worker,
+                                       shardshuffle=1024).\
+            shuffle(1000).decode("pil").to_tuple("jpg", "cls").map_tuple(
+             transform_train, label_to_index
+        ).with_epoch(train_samples_per_worker) 
+    
+    print(dataset_train)
 
-    if True:  # args.distributed:
-        num_tasks = misc.get_world_size()
-        global_rank = misc.get_rank()
-        sampler_train = torch.utils.data.DistributedSampler(
-            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+    dataset_val = (
+        wds.WebDataset(
+            args.data_path + "imagenet1k-validation-{00..63}.tar",
+            nodesplitter=wds.split_by_node,
+            workersplitter=wds.split_by_worker,
+            shardshuffle=False,
         )
-        print("Sampler_train = %s" % str(sampler_train))
-        if args.dist_eval:
-            if len(dataset_val) % num_tasks != 0:
-                print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
-                      'This will slightly alter validation results as extra duplicate entries are added to achieve '
-                      'equal num of samples per-process.')
-            sampler_val = torch.utils.data.DistributedSampler(
-                dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=True)  # shuffle=True to reduce monitor bias
-        else:
-            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        .decode("pil")
+        .to_tuple("jpg", "cls")
+        .map_tuple(transform_val, label_to_index)
+    )
+
+    global_rank = misc.get_rank()
 
     if global_rank == 0 and not args.eval:
         run = wandb.init(project="mae-finetune", config=vars(args))
@@ -197,15 +218,16 @@ def main(args):
         run = None
 
     data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
+        dataset_train, sampler=None,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
+        pin_memory=True,
         drop_last=True,
+        persistent_workers=True,
     )
 
     data_loader_val = torch.utils.data.DataLoader(
-        dataset_val, sampler=sampler_val,
+        dataset_val, sampler=None,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
@@ -221,14 +243,15 @@ def main(args):
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
     
-    model = models_vit.__dict__[args.model](
-        num_classes=args.nb_classes,
-        drop_path_rate=args.drop_path,
-        global_pool=args.global_pool,
-    )
+    # model = models_vit.__dict__[args.model](
+    #     num_classes=args.nb_classes,
+    #     drop_path_rate=args.drop_path,
+    #     global_pool=args.global_pool,
+    # )
+    model = timm.create_model(args.model, pretrained=False, num_classes=args.nb_classes, global_pool='avg')
 
     if args.finetune and not args.eval:
-        checkpoint = torch.load(args.finetune, map_location='cpu')
+        checkpoint = torch.load(args.finetune, map_location='cpu', weights_only=False)
 
         print("Load pre-trained checkpoint from: %s" % args.finetune)
         checkpoint_model = checkpoint['model']
@@ -254,6 +277,10 @@ def main(args):
         trunc_normal_(model.head.weight, std=2e-5)
 
     model.to(device)
+
+    if args.compile:
+        print("Compiling the model with torch.compile()...")
+        model = torch.compile(model)
 
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -298,15 +325,15 @@ def main(args):
 
     if args.eval:
         test_stats = evaluate(data_loader_val, model, device)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        print(f"Accuracy of the network on the {IMAGENET_VAL_SAMPLES} test images: {test_stats['acc1']:.1f}%")
         exit(0)
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     max_accuracy = 0.0
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
+        # if args.distributed:
+        #     data_loader_train.sampler.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
@@ -315,22 +342,23 @@ def main(args):
             args=args
         )
         if args.output_dir:
-            misc.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch)
+            if (epoch + 1) % args.save_ckpt_freq == 0 or epoch == args.epochs - 1:
+                misc.save_model(
+                    args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                    loss_scaler=loss_scaler, epoch=epoch)
 
         test_stats = evaluate(data_loader_val, model, device)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        print(f"Accuracy of the network on the {IMAGENET_VAL_SAMPLES} test images: {test_stats['acc1']:.1f}%")
         max_accuracy = max(max_accuracy, test_stats["acc1"])
         print(f'Max accuracy: {max_accuracy:.2f}%')
 
         if run is not None:
             run.log({
-                'perf/test_acc1': test_stats['acc1'],
-                'perf/test_acc5': test_stats['acc5'],
-                'perf/test_loss': test_stats['loss'],
+                'test_acc1': test_stats['acc1'],
+                'test_acc5': test_stats['acc5'],
+                'test_loss': test_stats['loss'],
                 'epoch': epoch,
-            }, step=epoch)
+            })
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                         **{f'test_{k}': v for k, v in test_stats.items()},
